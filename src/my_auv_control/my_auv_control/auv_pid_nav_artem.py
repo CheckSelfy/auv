@@ -130,50 +130,70 @@ class AUVController(Node):
             cmd_hr = max(-0.15, min(0.15, roll_pid + self.roll_bias))
 
         elif self.state == 'NAV':
-            target_speed = max(self.min_cruise_speed, min(self.max_cruise_speed, self.dist_2d * 0.35))
-            if self.vel > target_speed + self.brake_threshold: thrust = 0.8  
-            else: thrust = -target_speed * 3.3  
-              
-            # Проверка предиктивного входа (1.5n)
-            if self.dist_2d < PREDICTIVE_ZONE and abs(z_err) >= 1.5:
-                abs_dz = abs(dz_dt) if abs(dz_dt) > 0.05 else 0.05
+            # === НОВОЕ: координация с глубиной ===
+            z_factor = max(0.35, 1.0 - abs(z_err) / 10.0)   # при |Z_err| > 10 м — скорость падает до 35%
+            
+            target_speed = max(self.min_cruise_speed, 
+                             min(self.max_cruise_speed, self.dist_2d * 0.35))
+            target_speed *= z_factor   # ← вот это главное!
+
+            if self.vel > target_speed + self.brake_threshold:
+                thrust = 0.8
+            else:
+                thrust = -target_speed * 3.3
+
+            # Проверка входа в орбиту (делаем чуть раньше)
+            if self.dist_2d < PREDICTIVE_ZONE * 1.2 and abs(z_err) >= 1.2:
+                abs_dz = max(abs(dz_dt), 0.05)
                 time_to_climb = abs(z_err) / abs_dz
-                abs_vel = abs(self.vel) if abs(self.vel) > 0.1 else 0.1
+                abs_vel = max(abs(self.vel), 0.1)
                 time_to_target = self.dist_2d / abs_vel
                 
-                if time_to_climb > time_to_target:
+                if time_to_climb > time_to_target * 0.85:   # немного раньше
                     self.state = 'ORBIT'
-                    sys.stdout.write(f"\n🔮 PREDICT | Начинаем контролируемое торможение перед орбитой...\n")
+                    print(f"\n🔮 PREDICT | Z-ошибка доминирует → переходим в безопасную орбиту")
                     sys.stdout.flush()
 
-            # Динамический дифференциал (зависит от скорости)
+            # Динамический дифференциал
             k_diff = self.K_diff_base * (1.0 + abs(self.vel))
             diff = k_diff * yaw_err
-            cmd_lt = thrust + diff; cmd_rt = thrust - diff
+            cmd_lt = thrust + diff
+            cmd_rt = thrust - diff
 
         elif self.state == 'ORBIT':
-            # 🔥 БЕЗОПАСНАЯ СКОРОСТЬ КРУЖЕНИЯ (Опора на воду)
-            # Держим 0.75 м/с, чтобы рули крена физически работали и держали лодку ровно
-            target_orbit_speed = 0.75 
+            # Безопасная скорость орбиты
+            target_orbit_speed = 0.80
             if self.vel > target_orbit_speed + 0.1:
-                thrust = 1.0  # Легкое притормаживание без фанатизма
+                thrust = 1.0
             else:
                 thrust = -target_orbit_speed * 3.3
 
-            # Ограничиваем дифференциал моторов, чтобы не скручивать лодку на малом ходу
-            k_diff = 2.5  
-            diff = k_diff * yaw_err
-            cmd_lt = thrust + diff; cmd_rt = thrust - diff
+            # === УЛУЧШЕННЫЙ КОНТРОЛЬ РАДИУСА ===
+            radius_error = self.dist_2d - ORBIT_RADIUS
+            # Более агрессивная коррекция + ограничение по углу
+            correction_angle = max(-0.85, min(0.85, radius_error * 0.38))   # ← было 0.12!
+            
+            # Базовый тангенциальный угол (против часовой)
+            angle_to_sub = math.atan2(self.pos[1] - self.target_global[1],
+                                      self.pos[0] - self.target_global[0])
+            self.bearing = angle_to_sub + math.pi/2 + correction_angle
 
-            # 🔥 АВАРИЙНЫЙ ПРЕДОХРАНИТЕЛЬ: Если крен ушел за 35 градусов, выключаем разворот!
+            # Ограниченный дифференциал моторов (чтобы не скручивать на малой скорости)
+            k_diff = 2.8
+            diff = k_diff * yaw_err
+            cmd_lt = thrust + diff
+            cmd_rt = thrust - diff
+
+            # Аварийный предохранитель крена
             if abs(math.degrees(roll_err)) > 35.0:
                 cmd_lt = thrust
                 cmd_rt = thrust
-                rudder_v = 0.0  # Ставим руль прямо, спасаем лодку от переворота
+                rudder_v = 0.0
 
-            if abs(z_err) < 1.5:
+            # Выход из орбиты, когда глубина почти набрана
+            if abs(z_err) < 1.2:
                 self.state = 'FINAL_LOCK'
-                sys.stdout.write(f"\n🎯 FINAL | Высота зафиксирована стабильно. Выходим в центр...\n")
+                print(f"\n🎯 FINAL | Глубина стабилизирована → выходим в центр")
                 sys.stdout.flush()
 
         elif self.state == 'FINAL_LOCK':
