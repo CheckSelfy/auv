@@ -166,22 +166,23 @@ class AUVController(Node):
             cmd_rt = thrust - diff
 
         elif self.state == 'ORBIT':
-            # 🔥 ЕЩЁ БЫСТРЕЕ НА ОРБИТЕ
-            target_orbit_speed = 1.45     # ← было 1.15, теперь 1.45 м/с
-            if self.vel > target_orbit_speed + 0.15:
-                thrust = 1.2
+            # 🔥 ЦЕЛЕВАЯ СКОРОСТЬ НА ОРБИТЕ 2.5 м/с
+            target_orbit_speed = 2.5
+            if self.vel > target_orbit_speed + 0.2:
+                thrust = 1.8          # сильный тормоз при превышении
             else:
-                thrust = -target_orbit_speed * 3.7
+                thrust = -target_orbit_speed * 9.5   # ← сильно увеличен коэффициент, чтобы выжать 2.5 м/с
 
-            # === КОНТРОЛЬ РАДИУСА (адаптировано под большую скорость) ===
+            # === КОНТРОЛЬ РАДИУСА (адаптировано под высокую скорость) ===
             radius_error = self.dist_2d - ORBIT_RADIUS
-            correction_angle = max(-1.1, min(1.1, radius_error * 0.68))
+            correction_angle = max(-1.15, min(1.15, radius_error * 0.72))
             
             angle_to_sub = math.atan2(self.pos[1] - self.target_global[1],
                                       self.pos[0] - self.target_global[0])
             self.bearing = angle_to_sub + math.pi/2 + correction_angle
 
-            k_diff = 3.7
+            # Дифференциал под высокую скорость
+            k_diff = 4.2
             diff = k_diff * yaw_err
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
