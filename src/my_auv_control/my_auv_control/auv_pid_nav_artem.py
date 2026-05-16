@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AUV PID Autopilot v35.3 | LOS Adaptive + ULTRA Anti-Capsize (ANTI-ROLL FIX)"""
+"""AUV PID Autopilot v35.4 | LOS Adaptive + ULTRA Anti-Capsize (ROLL FIXED v2)"""
 import rclpy, math, time, sys
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
@@ -53,13 +53,14 @@ class AUVController(Node):
         self.Kd_yaw = 0.5
         self.K_diff_base = 2.5
 
-        # 🔥 ULTRA ANTI-CAPSIZE — УСИЛЕНО И ИСПРАВЛЕНО
-        self.Kp_roll = 80.0      # было 45 → теперь намного сильнее
-        self.Kd_roll = 20.0      # было 12
-        self.roll_bias = 0.08
+        # 🔥 ULTRA ANTI-CAPSIZE v2 — ЕЩЁ СИЛЬНЕЕ И С ПРАВИЛЬНЫМ ЗНАКОМ
+        self.Kp_roll = 120.0      # сильно увеличено
+        self.Kd_roll = 30.0
+        self.roll_bias = 0.05
         
-        # Новый параметр — переворот знака дифференциала рулей (главная причина капсулирования)
-        self.roll_sign_flip = True   # ← ИСПРАВЛЕНИЕ: меняем знак крена
+        # ←←← ГЛАВНОЕ ИСПРАВЛЕНИЕ: знак дифференциала горизонтальных рулей
+        # Если продолжает крениться вправо — поменяй на -1.0
+        self.roll_correction_sign = -1.0
 
         self.stable_t = 0.0
         self.dt = 0.05
@@ -73,7 +74,7 @@ class AUVController(Node):
     def press_cb(self, msg):
         self.baro_z = (P_Z0 - msg.data) / RHO_G
         if not hasattr(self, '_pressure_logged'):
-            print(f"✅ Pressure sensor OK! baro_z = {self.baro_z:+.3f} м (отрицательное = глубина)")
+            print(f"✅ Pressure sensor OK! baro_z = {self.baro_z:+.3f} м")
             self._pressure_logged = True
 
     def odom_cb(self, msg):
@@ -92,11 +93,9 @@ class AUVController(Node):
             self.prev_rpy = list(self.rpy)
             self.prev_baro_z = self.baro_z
             self.state = 'STAB'
-            print(f"\n🎯 Запуск LOS Adaptive v35.3 + ULTRA Anti-Capsize (ROLL FIXED)")
+            print(f"\n🎯 Запуск LOS Adaptive v35.4 + ULTRA Anti-Capsize (ROLL FIXED v2)")
             print(f"   Цель: X={self.target_global[0]:.1f} Y={self.target_global[1]:.1f} Z={self.target_global[2]:.1f}")
-            if self.target_global[2] > 0:
-                print("⚠️  ВНИМАНИЕ: Z > 0 — это ВВЕРХ. Для погружения используй ОТРИЦАТЕЛЬНЫЕ значения Z!")
-            print(f"   Глубина по барометру: {self.baro_z:+.2f} м")
+            print(f"   roll_correction_sign = {self.roll_correction_sign} (поменяй на -1.0 / 1.0 если кренится не туда)")
 
         dx = self.target_global[0] - self.pos[0]
         dy = self.target_global[1] - self.pos[1]
@@ -127,17 +126,16 @@ class AUVController(Node):
         rudder_v = self.Kp_yaw * yaw_err + self.Kd_yaw * d_yaw
         rudder_v = max(-0.45, min(0.45, rudder_v))
 
-        # === ROLL CONTROL (ИСПРАВЛЕННЫЙ ЗНАК) ===
+        # === ROLL CONTROL (с правильным знаком) ===
         roll_err = self.rpy[0]
         d_roll = (self.rpy[0] - self.prev_rpy[0]) / self.dt
         roll_pid = self.Kp_roll * roll_err + self.Kd_roll * d_roll
 
-        # ←←← ГЛАВНОЕ ИСПРАВЛЕНИЕ: меняем знак дифференциала горизонтальных рулей
-        sign = 1.0 if self.roll_sign_flip else -1.0
+        sign = self.roll_correction_sign
         cmd_hl = rudder_h + sign * roll_pid - self.roll_bias
         cmd_hr = rudder_h - sign * roll_pid + self.roll_bias
 
-        cmd_hl = max(-0.78, min(0.78, cmd_hl))   # расширили диапазон
+        cmd_hl = max(-0.78, min(0.78, cmd_hl))
         cmd_hr = max(-0.78, min(0.78, cmd_hr))
         self.prev_rpy = list(self.rpy)
         
@@ -155,7 +153,6 @@ class AUVController(Node):
                 self.stable_t = 0.0
             if self.stable_t >= 1.5:
                 self.state = 'NAV'
-            # мягкая стабилизация крена в начале
             cmd_hl = max(-0.25, min(0.25, sign * roll_pid - self.roll_bias))
             cmd_hr = max(-0.25, min(0.25, -sign * roll_pid + self.roll_bias))
 
@@ -183,25 +180,22 @@ class AUVController(Node):
 
             # === УСИЛЕННАЯ ЗАЩИТА ОТ КАПСУЛИРОВАНИЯ ===
             roll_deg = math.degrees(roll_err)
-            if abs(roll_deg) > 12.0:                     # срабатывает раньше!
+            if abs(roll_deg) > 8.0:                     # срабатывает ОЧЕНЬ рано
                 self.roll_protection_active = True
                 emergency = True
-                thrust = -3.8                            # сильный тормоз
+                thrust = -5.0                           # ОЧЕНЬ сильный тормоз
                 cmd_lt = thrust
                 cmd_rt = thrust
-                rudder_v = 0.0                           # не мешаем курсу
+                rudder_v = 0.0
 
-                # Максимально агрессивный дифференциал (с учётом исправленного знака)
+                # Максимально агрессивный дифференциал рулей
                 emergency_rudder = 0.78 * sign * (-1 if roll_err < 0 else 1)
                 cmd_hl = emergency_rudder
                 cmd_hr = -emergency_rudder
 
-                if abs(roll_deg) > 50.0:
-                    print(f"🚨 CRITICAL RECOVERY | Roll {roll_deg:+.1f}° — MAX effort")
-                else:
-                    print(f"⚠️  ROLL PROTECTION | Roll {roll_deg:+.1f}° → emergency correction")
+                print(f"⚠️  ROLL PROTECTION | Roll {roll_deg:+.1f}° | "
+                      f"cmd_hl={cmd_hl:+.3f} cmd_hr={cmd_hr:+.3f} | sign={sign}")
 
-            # Переход в финальный подход
             if self.dist_2d < 12.0 and abs(z_err) < 2.5:
                 self.state = 'FINAL_LOCK'
                 print(f"\n🔄 Переход в FINAL_LOCK")
@@ -220,7 +214,7 @@ class AUVController(Node):
             if self.dist_2d < 2.5 and abs(z_err) < 1.4:
                 self.state = 'FINISH'
                 self._pub(0, 0, 0, 0, 0)
-                print(f"\n✅ МИССИЯ ЗАВЕРШЕНА! Точное попадание")
+                print(f"\n✅ МИССИЯ ЗАВЕРШЕНА!")
                 print(f"Финиш: X={self.pos[0]:.2f} Y={self.pos[1]:.2f} Z={self.pos[2]:.2f}")
                 raise SystemExit
 
@@ -240,17 +234,16 @@ class AUVController(Node):
 
     def run(self):
         try:
-            print("="*75)
-            print("🚢 AUV v35.3 LOS Adaptive + ULTRA Anti-Capsize (ROLL FIXED)")
-            print("="*75)
-            print("📍 ВНИМАНИЕ: Z — это координата по вертикали.")
-            print("   Отрицательное Z = глубина (например -15 = 15 метров вниз)")
-            print("   Положительное Z = вверх (не используй для погружения!)")
+            print("="*80)
+            print("🚢 AUV v35.4 LOS Adaptive + ULTRA Anti-Capsize (ROLL FIXED v2)")
+            print("="*80)
+            print("📍 Z = отрицательное значение = глубина (например 15 → Z=-15)")
+            print("   roll_correction_sign = -1.0 (поменяй на 1.0 в коде если кренится не туда)")
             print()
             self.raw_target_x = float(input("📍 Абсолютный X цели: "))
             self.raw_target_y = float(input("📍 Абсолютный Y цели: "))
-            z_input = float(input("📍 Глубина цели (м, положительное): "))
-            self.raw_target_z = -z_input                     # ← ПРАВИЛЬНАЯ КОНВЕРСИЯ
+            z_input = float(input("📍 Глубина цели (м, положительное число): "))
+            self.raw_target_z = -z_input
             rclpy.spin(self)
         except (KeyboardInterrupt, SystemExit):
             self._pub(0, 0, 0, 0, 0)
