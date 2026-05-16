@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AUV PID Autopilot v34.1 | Anti-Capsize System | Safe Velocity Orbit"""
+"""AUV PID Autopilot v35.0 | LOS Adaptive Guidance | No Orbit"""
 import rclpy, math, time, sys
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
@@ -9,8 +9,6 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 P_Z0 = 101325.0
 RHO_G = 9810.0
 
-ORBIT_RADIUS = 20.0  
-PREDICTIVE_ZONE = ORBIT_RADIUS * 2.4
 
 class AUVController(Node):
     def __init__(self):
@@ -39,19 +37,24 @@ class AUVController(Node):
         
         # Настройки маршевой скорости
         self.max_cruise_speed = 2.5  
-        self.min_cruise_speed = 0.8  
+        self.min_cruise_speed = 0.6  
         self.brake_threshold = 0.2
-  
-        # ПИД Z (Задемфированный, чтобы не раскачивать нос)
+
+        # === LOS GUIDANCE ПАРАМЕТРЫ ===
+        self.lookahead_base = 25.0      # базовый lookahead (м)
+        self.min_lookahead = 8.0
+        self.max_cross_track = 12.0     # максимальная боковая ошибка
+
+        # ПИД Z (глубина)
         self.Kp_z = 4.2; self.Kd_z = 1.7
         
         # Базовый курс
         self.Kp_yaw = 1.8; self.Kd_yaw = 0.5
-        self.K_diff_base = 3.0  # Умеренный базовый дифференциал
+        self.K_diff_base = 3.0
 
-        # 🔥 ЭКСТРЕМАЛЬНАЯ СТАБИЛИЗАЦИЯ КРЕНА (Защита от переворота)
-        self.Kp_roll = 16.0; self.Kd_roll = 5.0
-        self.roll_bias = 0.04
+        # 🔥 УСИЛЕННАЯ СТАБИЛИЗАЦИЯ КРЕНА
+        self.Kp_roll = 22.0; self.Kd_roll = 7.0
+        self.roll_bias = 0.06
         
         self.stable_t = 0.0; self.dt = 0.05
         self.timer = self.create_timer(self.dt, self.loop)
@@ -75,23 +78,24 @@ class AUVController(Node):
             self.prev_rpy = list(self.rpy)
             self.prev_baro_z = self.baro_z
             self.state = 'STAB'
-            print(f"\n🎯 Запуск Anti-Capsize системы v34.1:")
+            print(f"\n🎯 Запуск LOS Adaptive v35.0:")
             print(f"   Цель: X={self.target_global[0]:.2f} Y={self.target_global[1]:.2f} Z={self.target_global[2]:.2f}")
 
-        dx_rem = self.target_global[0] - self.pos[0]
-        dy_rem = self.target_global[1] - self.pos[1]
-        self.dist_2d = math.hypot(dx_rem, dy_rem)
+        dx = self.target_global[0] - self.pos[0]
+        dy = self.target_global[1] - self.pos[1]
+        self.dist_2d = math.hypot(dx, dy)
 
-        if self.state == 'ORBIT':
-            angle_to_sub = math.atan2(self.pos[1] - self.target_global[1], self.pos[0] - self.target_global[0])
-            radius_error = self.dist_2d - ORBIT_RADIUS
-            correction_angle = max(-0.4, min(0.4, radius_error * 0.12))
-            self.bearing = angle_to_sub + math.pi/2 + correction_angle
-        else:
-            self.bearing = math.atan2(dy_rem, dx_rem)
+        # === LOS GUIDANCE (Line-of-Sight) ===
+        path_bearing = math.atan2(dy, dx)
+        # signed cross-track error
+        cross_track = (dx * math.sin(self.rpy[2]) - dy * math.cos(self.rpy[2])) * -1.0
+        
+        lookahead = max(self.min_lookahead, min(self.lookahead_base, self.dist_2d * 0.6))
+        correction = math.atan2(cross_track, lookahead)
+        self.bearing = path_bearing + correction
 
     def loop(self):
-        if self.state not in ['STAB', 'NAV', 'ORBIT', 'FINAL_LOCK']: return
+        if self.state not in ['STAB', 'NAV', 'FINAL_LOCK']: return
         
         # 🔹 ВЫЧИСЛЕНИЕ ВЫСОТЫ
         z_err = self.pos[2] - self.target_global[2] 
@@ -100,7 +104,7 @@ class AUVController(Node):
         rudder_h = max(-0.22, min(0.22, raw_h)) 
         self.prev_baro_z = self.pos[2]
 
-        # 🔹 ВЫЧИСЛЕНИЕ КУРСА
+        # 🔹 ВЫЧИСЛЕНИЕ КУРСА (LOS bearing уже рассчитан в odom_cb)
         yaw_err = math.atan2(math.sin(self.bearing - self.rpy[2]), math.cos(self.bearing - self.rpy[2]))
         if abs(math.degrees(yaw_err)) < 1.0: yaw_err = 0.0
         
@@ -130,93 +134,58 @@ class AUVController(Node):
             cmd_hr = max(-0.15, min(0.15, roll_pid + self.roll_bias))
 
         elif self.state == 'NAV':
-            # === ЕЩЁ БОЛЕЕ АГРЕССИВНОЕ ТОРМОЖЕНИЕ ПРИ ПОДХОДЕ ===
-            z_factor = max(0.55, 1.0 - abs(z_err) / 12.0)   # чуть сильнее влияние глубины
-            
-            # Скорость падает гораздо быстрее при приближении к цели
-            base_speed = self.dist_2d * 0.42
-            if self.dist_2d < 35.0:
-                base_speed = self.dist_2d * 0.18   # ← сильное торможение на последних 35 м
-            if self.dist_2d < 15.0:
-                base_speed = self.dist_2d * 0.08   # почти стоп на 15 м
-            
+            # === АДАПТИВНАЯ СКОРОСТЬ + LOS ===
+            z_factor = max(0.45, 1.0 - abs(z_err) / 18.0)
+
+            if self.dist_2d > 40.0:
+                base_speed = self.max_cruise_speed
+            elif self.dist_2d > 15.0:
+                base_speed = self.dist_2d * 0.12
+            else:
+                base_speed = self.dist_2d * 0.06
+
             target_speed = max(self.min_cruise_speed, min(self.max_cruise_speed, base_speed))
             target_speed *= z_factor
 
             if self.vel > target_speed + self.brake_threshold:
-                thrust = 0.9      # чуть сильнее тормоз
+                thrust = 1.4
             else:
-                thrust = -target_speed * 3.5   # ← коэффициент чуть увеличен
+                thrust = -target_speed * 4.2
 
-            # Проверка входа в орбиту (теперь ещё раньше)
-            if self.dist_2d < PREDICTIVE_ZONE and abs(z_err) >= 1.8:
-                abs_dz = max(abs(dz_dt), 0.05)
-                time_to_climb = abs(z_err) / abs_dz
-                abs_vel = max(abs(self.vel), 0.1)
-                time_to_target = max(self.dist_2d / abs_vel, 0.1)
-                
-                if time_to_climb > time_to_target * 0.85:
-                    self.state = 'ORBIT'
-                    print(f"\n🔮 PREDICT | Большая Z-ошибка → переходим в орбиту")
-                    sys.stdout.flush()
-
-            k_diff = self.K_diff_base * (1.0 + abs(self.vel) * 1.3)
+            # Дифференциал
+            k_diff = self.K_diff_base * (1.0 + abs(self.vel) * 1.4)
             diff = k_diff * yaw_err
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
 
-        elif self.state == 'ORBIT':
-            # 🔥 ЦЕЛЕВАЯ СКОРОСТЬ НА ОРБИТЕ 2.5 м/с
-            target_orbit_speed = 2.5
-            if self.vel > target_orbit_speed + 0.2:
-                thrust = 1.8          # сильный тормоз при превышении
-            else:
-                thrust = -target_orbit_speed * 9.5   # ← сильно увеличен коэффициент, чтобы выжать 2.5 м/с
-
-            # === КОНТРОЛЬ РАДИУСА (адаптировано под высокую скорость) ===
-            radius_error = self.dist_2d - ORBIT_RADIUS
-            correction_angle = max(-1.15, min(1.15, radius_error * 0.72))
-            
-            angle_to_sub = math.atan2(self.pos[1] - self.target_global[1],
-                                      self.pos[0] - self.target_global[0])
-            self.bearing = angle_to_sub + math.pi/2 + correction_angle
-
-            # Дифференциал под высокую скорость
-            k_diff = 4.2
-            diff = k_diff * yaw_err
-            cmd_lt = thrust + diff
-            cmd_rt = thrust - diff
-
-            if abs(math.degrees(roll_err)) > 35.0:
+            # Защита от большого крена
+            if abs(math.degrees(roll_err)) > 25.0:
+                thrust = 2.0
                 cmd_lt = thrust
                 cmd_rt = thrust
-                rudder_v = 0.0
+                print("⚠️  ROLL PROTECTION — emergency slowdown")
 
-            if abs(z_err) < 1.5 and abs(radius_error) < 4.0:
+            # Переход в финальный точный подход
+            if self.dist_2d < 12.0 and abs(z_err) < 2.5:
                 self.state = 'FINAL_LOCK'
-                print(f"\n🎯 FINAL | Орбита завершена → точный подход")
+                print(f"\n🔄 Переход в FINAL_LOCK — точный подход")
                 sys.stdout.flush()
 
         elif self.state == 'FINAL_LOCK':
-            # Очень агрессивное торможение на финальном подходе
-            if self.dist_2d < 8.0:
-                target_speed = self.dist_2d * 0.12   # почти стоп
+            target_speed = max(0.4, min(1.0, self.dist_2d * 0.08))
+            if self.vel > target_speed + 0.1:
+                thrust = 1.6
             else:
-                target_speed = max(self.min_cruise_speed, min(1.2, self.dist_2d * 0.35))
+                thrust = -target_speed * 5.0
 
-            if self.vel > target_speed + 0.15:
-                thrust = 1.2          # сильный тормоз
-            else:
-                thrust = -target_speed * 3.8
-
-            diff = self.K_diff_base * 1.1 * yaw_err
+            diff = self.K_diff_base * 1.2 * yaw_err
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
 
-            if self.dist_2d < 3.0 and abs(z_err) < 1.3:
+            if self.dist_2d < 2.5 and abs(z_err) < 1.4:
                 self.state = 'FINISH'
                 self._pub(0,0,0,0,0)
-                print(f"\n\r✅ МИССИЯ ЗАВЕРШЕНА | Точное попадание!")
+                print(f"\n\r✅ МИССИЯ ЗАВЕРШЕНА | Точное попадание LOS!")
                 print(f"Финиш: X={self.pos[0]:.2f} Y={self.pos[1]:.2f} Z={self.pos[2]:.2f}")
                 raise SystemExit
 
@@ -234,7 +203,7 @@ class AUVController(Node):
 
     def run(self):
         try:
-            print("="*60 + "\n🚢 AUV v34.1 (Anti-Capsize & Safe Orbit Profile)\n" + "="*60)
+            print("="*60 + "\n🚢 AUV v35.0 LOS Adaptive Guidance\n" + "="*60)
             self.raw_target_x = float(input("📍 Абсолютный X цели: "))
             self.raw_target_y = float(input("📍 Абсолютный Y цели: "))
             self.raw_target_z = float(input("📍 Абсолютный Z цели: "))
