@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AUV PID Autopilot v35.0 | LOS Adaptive Guidance | No Orbit"""
+"""AUV PID Autopilot v35.1 | LOS Adaptive + ULTRA Anti-Capsize"""
 import rclpy, math, time, sys
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
@@ -41,23 +41,24 @@ class AUVController(Node):
         self.brake_threshold = 0.2
 
         # === LOS GUIDANCE ПАРАМЕТРЫ ===
-        self.lookahead_base = 25.0      # базовый lookahead (м)
+        self.lookahead_base = 25.0
         self.min_lookahead = 8.0
-        self.max_cross_track = 12.0     # максимальная боковая ошибка
+        self.max_cross_track = 12.0
 
         # ПИД Z (глубина)
         self.Kp_z = 4.2; self.Kd_z = 1.7
         
-        # Базовый курс
+        # Базовый курс (чуть мягче, чтобы меньше провоцировать крен)
         self.Kp_yaw = 1.8; self.Kd_yaw = 0.5
-        self.K_diff_base = 3.0
+        self.K_diff_base = 2.5   # ← уменьшен, меньше скручивания
 
-        # 🔥 УСИЛЕННАЯ СТАБИЛИЗАЦИЯ КРЕНА
-        self.Kp_roll = 22.0; self.Kd_roll = 7.0
-        self.roll_bias = 0.06
+        # 🔥 ULTRA ANTI-CAPSIZE (очень сильная защита от переворота)
+        self.Kp_roll = 45.0; self.Kd_roll = 12.0
+        self.roll_bias = 0.08
         
         self.stable_t = 0.0; self.dt = 0.05
         self.timer = self.create_timer(self.dt, self.loop)
+        self.roll_protection_active = False
 
     def press_cb(self, msg):
         self.baro_z = (P_Z0 - msg.data) / RHO_G
@@ -78,16 +79,15 @@ class AUVController(Node):
             self.prev_rpy = list(self.rpy)
             self.prev_baro_z = self.baro_z
             self.state = 'STAB'
-            print(f"\n🎯 Запуск LOS Adaptive v35.0:")
+            print(f"\n🎯 Запуск LOS Adaptive v35.1 + ULTRA Anti-Capsize:")
             print(f"   Цель: X={self.target_global[0]:.2f} Y={self.target_global[1]:.2f} Z={self.target_global[2]:.2f}")
 
         dx = self.target_global[0] - self.pos[0]
         dy = self.target_global[1] - self.pos[1]
         self.dist_2d = math.hypot(dx, dy)
 
-        # === LOS GUIDANCE (Line-of-Sight) ===
+        # === LOS GUIDANCE ===
         path_bearing = math.atan2(dy, dx)
-        # signed cross-track error
         cross_track = (dx * math.sin(self.rpy[2]) - dy * math.cos(self.rpy[2])) * -1.0
         
         lookahead = max(self.min_lookahead, min(self.lookahead_base, self.dist_2d * 0.6))
@@ -104,7 +104,7 @@ class AUVController(Node):
         rudder_h = max(-0.22, min(0.22, raw_h)) 
         self.prev_baro_z = self.pos[2]
 
-        # 🔹 ВЫЧИСЛЕНИЕ КУРСА (LOS bearing уже рассчитан в odom_cb)
+        # 🔹 ВЫЧИСЛЕНИЕ КУРСА
         yaw_err = math.atan2(math.sin(self.bearing - self.rpy[2]), math.cos(self.bearing - self.rpy[2]))
         if abs(math.degrees(yaw_err)) < 1.0: yaw_err = 0.0
         
@@ -112,18 +112,22 @@ class AUVController(Node):
         rudder_v = (self.Kp_yaw * yaw_err + self.Kd_yaw * d_yaw)
         rudder_v = max(-0.45, min(0.45, rudder_v))
 
-        # 🔹 МОЩНЫЙ КОНТУР СТАБИЛИЗАЦИИ КРЕНА
+        # 🔹 ULTRA ANTI-CAPSIZE — стабилизация крена
         roll_err = self.rpy[0]
         d_roll = (self.rpy[0] - self.prev_rpy[0]) / self.dt
         roll_pid = self.Kp_roll * roll_err + self.Kd_roll * d_roll
         
+        # Обычные команды горизонтальных рулей
         cmd_hl = rudder_h - roll_pid - self.roll_bias
         cmd_hr = rudder_h + roll_pid + self.roll_bias
-        cmd_hl = max(-0.6, min(0.6, cmd_hl))
-        cmd_hr = max(-0.6, min(0.6, cmd_hr))
+
+        # Ограничение
+        cmd_hl = max(-0.65, min(0.65, cmd_hl))
+        cmd_hr = max(-0.65, min(0.65, cmd_hr))
         self.prev_rpy = list(self.rpy)
         
         thrust = 0.0; cmd_lt = 0.0; cmd_rt = 0.0
+        self.roll_protection_active = False
 
         # ================= АВТОМАТ ТРАЕКТОРИЙ =================
         if self.state == 'STAB':
@@ -158,14 +162,19 @@ class AUVController(Node):
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
 
-            # Защита от большого крена
-            if abs(math.degrees(roll_err)) > 25.0:
-                thrust = 2.0
+            # === ULTRA ROLL PROTECTION (срабатывает раньше и сильнее) ===
+            if abs(math.degrees(roll_err)) > 20.0:          # ← раньше, чем было
+                self.roll_protection_active = True
+                thrust = 2.2                               # сильный тормоз
                 cmd_lt = thrust
                 cmd_rt = thrust
-                print("⚠️  ROLL PROTECTION — emergency slowdown")
+                # Принудительно выравниваем горизонтальные рули против крена
+                emergency_rudder = 0.65 * (1 if roll_err < 0 else -1)
+                cmd_hl = emergency_rudder
+                cmd_hr = -emergency_rudder
+                print(f"⚠️  ROLL PROTECTION — emergency slowdown | Roll: {math.degrees(roll_err):+.1f}°")
 
-            # Переход в финальный точный подход
+            # Переход в финальный подход
             if self.dist_2d < 12.0 and abs(z_err) < 2.5:
                 self.state = 'FINAL_LOCK'
                 print(f"\n🔄 Переход в FINAL_LOCK — точный подход")
@@ -190,7 +199,8 @@ class AUVController(Node):
                 raise SystemExit
 
         self._pub(cmd_lt, cmd_rt, rudder_v, cmd_hl, cmd_hr)
-        print(f"\r[{self.state:10}] Pos:[{self.pos[0]:+.1f}, {self.pos[1]:+.1f}, {self.pos[2]:+.2f}] | "
+        status = "ROLL_PROT" if self.roll_protection_active else self.state
+        print(f"\r[{status:10}] Pos:[{self.pos[0]:+.1f}, {self.pos[1]:+.1f}, {self.pos[2]:+.2f}] | "
               f"Dist2D:{self.dist_2d:.1f}m | V:{self.vel:+.2f} | Z_Err:{z_err:+.2f} | "
               f"Roll:{math.degrees(roll_err):+.1f}°", end='', flush=True)
 
@@ -203,7 +213,7 @@ class AUVController(Node):
 
     def run(self):
         try:
-            print("="*60 + "\n🚢 AUV v35.0 LOS Adaptive Guidance\n" + "="*60)
+            print("="*60 + "\n🚢 AUV v35.1 LOS Adaptive + ULTRA Anti-Capsize\n" + "="*60)
             self.raw_target_x = float(input("📍 Абсолютный X цели: "))
             self.raw_target_y = float(input("📍 Абсолютный Y цели: "))
             self.raw_target_z = float(input("📍 Абсолютный Z цели: "))
