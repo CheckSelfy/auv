@@ -166,21 +166,23 @@ class AUVController(Node):
             cmd_rt = thrust - diff
 
         elif self.state == 'ORBIT':
-            target_orbit_speed = 0.75
-            if self.vel > target_orbit_speed + 0.1:
-                thrust = 1.0
+            # 🔥 УВЕЛИЧЕННАЯ СКОРОСТЬ ОРБИТЫ (быстрее кружим)
+            target_orbit_speed = 1.15     # ← было 0.75, теперь 1.15 м/с
+            if self.vel > target_orbit_speed + 0.12:
+                thrust = 1.1              # чуть сильнее тормоз на превышении
             else:
-                thrust = -target_orbit_speed * 3.5
+                thrust = -target_orbit_speed * 3.6
 
-            # === ОЧЕНЬ СИЛЬНЫЙ КОНТРОЛЬ РАДИУСА ===
+            # === ОЧЕНЬ СИЛЬНЫЙ КОНТРОЛЬ РАДИУСА (адаптировано под большую скорость) ===
             radius_error = self.dist_2d - ORBIT_RADIUS
-            correction_angle = max(-1.0, min(1.0, radius_error * 0.55))   # ← было 0.38, теперь агрессивнее
+            correction_angle = max(-1.05, min(1.05, radius_error * 0.62))   # чуть агрессивнее
             
             angle_to_sub = math.atan2(self.pos[1] - self.target_global[1],
                                       self.pos[0] - self.target_global[0])
             self.bearing = angle_to_sub + math.pi/2 + correction_angle
 
-            k_diff = 3.0
+            # Дифференциал моторов чуть увеличен под новую скорость
+            k_diff = 3.4
             diff = k_diff * yaw_err
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
@@ -190,7 +192,7 @@ class AUVController(Node):
                 cmd_rt = thrust
                 rudder_v = 0.0
 
-            # Выходим из орбиты только когда и глубина, и радиус почти идеальны
+            # Выходим из орбиты когда и глубина, и радиус почти идеальны
             if abs(z_err) < 1.5 and abs(radius_error) < 4.0:
                 self.state = 'FINAL_LOCK'
                 print(f"\n🎯 FINAL | Орбита завершена → точный подход")
