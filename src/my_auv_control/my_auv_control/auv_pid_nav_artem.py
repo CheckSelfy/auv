@@ -38,12 +38,12 @@ class AUVController(Node):
         self.prev_baro_z = 0.0
         
         # Настройки маршевой скорости
-        self.max_cruise_speed = 2.2  
-        self.min_cruise_speed = 0.6  
+        self.max_cruise_speed = 2.5  
+        self.min_cruise_speed = 0.8  
         self.brake_threshold = 0.2
   
         # ПИД Z (Задемфированный, чтобы не раскачивать нос)
-        self.Kp_z = 3.0; self.Kd_z = 1.4
+        self.Kp_z = 4.2; self.Kd_z = 1.7
         
         # Базовый курс
         self.Kp_yaw = 1.8; self.Kd_yaw = 0.5
@@ -130,32 +130,32 @@ class AUVController(Node):
             cmd_hr = max(-0.15, min(0.15, roll_pid + self.roll_bias))
 
         elif self.state == 'NAV':
-            # === НОВОЕ: координация с глубиной ===
-            z_factor = max(0.35, 1.0 - abs(z_err) / 10.0)   # при |Z_err| > 10 м — скорость падает до 35%
+            # === УЛУЧШЕННАЯ КООРДИНАЦИЯ (скорость выше, замедление мягче) ===
+            z_factor = max(0.65, 1.0 - abs(z_err) / 15.0)   # теперь замедляем только при |Z_err| > 15 м
             
             target_speed = max(self.min_cruise_speed, 
-                             min(self.max_cruise_speed, self.dist_2d * 0.35))
-            target_speed *= z_factor   # ← вот это главное!
+                             min(self.max_cruise_speed, self.dist_2d * 0.48))  # ← было 0.35, теперь 0.48
+            target_speed *= z_factor
 
             if self.vel > target_speed + self.brake_threshold:
                 thrust = 0.8
             else:
                 thrust = -target_speed * 3.3
 
-            # Проверка входа в орбиту (делаем чуть раньше)
-            if self.dist_2d < PREDICTIVE_ZONE * 1.2 and abs(z_err) >= 1.2:
+            # Проверка входа в орбиту (чуть раньше)
+            if self.dist_2d < PREDICTIVE_ZONE * 1.3 and abs(z_err) >= 1.3:
                 abs_dz = max(abs(dz_dt), 0.05)
                 time_to_climb = abs(z_err) / abs_dz
-                abs_vel = max(abs(self.vel), 0.1)
+                abs_vel = max(abs(self.vel), 0.12)
                 time_to_target = self.dist_2d / abs_vel
                 
-                if time_to_climb > time_to_target * 0.85:   # немного раньше
+                if time_to_climb > time_to_target * 0.9:
                     self.state = 'ORBIT'
-                    print(f"\n🔮 PREDICT | Z-ошибка доминирует → переходим в безопасную орбиту")
+                    print(f"\n🔮 PREDICT | Большая Z-ошибка → переходим в орбиту (скорость уже выше)")
                     sys.stdout.flush()
 
-            # Динамический дифференциал
-            k_diff = self.K_diff_base * (1.0 + abs(self.vel))
+            # Динамический дифференциал (чуть агрессивнее на высокой скорости)
+            k_diff = self.K_diff_base * (1.0 + abs(self.vel) * 1.2)
             diff = k_diff * yaw_err
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
