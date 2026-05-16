@@ -249,6 +249,7 @@ class AUVController(Node):
             self._pub(0, 0, 0, 0, 0)
             print("\n🛑 AUV остановлен.")
 
+
 def main():
     rclpy.init()
     node = AUVController()
