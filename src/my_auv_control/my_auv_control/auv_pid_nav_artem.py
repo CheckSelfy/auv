@@ -9,8 +9,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 P_Z0 = 101325.0
 RHO_G = 9810.0
 
-ORBIT_RADIUS = 15.0  
-PREDICTIVE_ZONE = ORBIT_RADIUS * 1.5  
+ORBIT_RADIUS = 20.0  
+PREDICTIVE_ZONE = ORBIT_RADIUS * 2.4
 
 class AUVController(Node):
     def __init__(self):
@@ -130,84 +130,92 @@ class AUVController(Node):
             cmd_hr = max(-0.15, min(0.15, roll_pid + self.roll_bias))
 
         elif self.state == 'NAV':
-            # === УЛУЧШЕННАЯ КООРДИНАЦИЯ (скорость выше, замедление мягче) ===
-            z_factor = max(0.65, 1.0 - abs(z_err) / 15.0)   # теперь замедляем только при |Z_err| > 15 м
+            # === ЕЩЁ БОЛЕЕ АГРЕССИВНОЕ ТОРМОЖЕНИЕ ПРИ ПОДХОДЕ ===
+            z_factor = max(0.55, 1.0 - abs(z_err) / 12.0)   # чуть сильнее влияние глубины
             
-            target_speed = max(self.min_cruise_speed, 
-                             min(self.max_cruise_speed, self.dist_2d * 0.48))  # ← было 0.35, теперь 0.48
+            # Скорость падает гораздо быстрее при приближении к цели
+            base_speed = self.dist_2d * 0.42
+            if self.dist_2d < 35.0:
+                base_speed = self.dist_2d * 0.18   # ← сильное торможение на последних 35 м
+            if self.dist_2d < 15.0:
+                base_speed = self.dist_2d * 0.08   # почти стоп на 15 м
+            
+            target_speed = max(self.min_cruise_speed, min(self.max_cruise_speed, base_speed))
             target_speed *= z_factor
 
             if self.vel > target_speed + self.brake_threshold:
-                thrust = 0.8
+                thrust = 0.9      # чуть сильнее тормоз
             else:
-                thrust = -target_speed * 3.3
+                thrust = -target_speed * 3.5   # ← коэффициент чуть увеличен
 
-            # Проверка входа в орбиту (чуть раньше)
-            if self.dist_2d < PREDICTIVE_ZONE * 1.3 and abs(z_err) >= 1.3:
+            # Проверка входа в орбиту (теперь ещё раньше)
+            if self.dist_2d < PREDICTIVE_ZONE and abs(z_err) >= 1.8:
                 abs_dz = max(abs(dz_dt), 0.05)
                 time_to_climb = abs(z_err) / abs_dz
-                abs_vel = max(abs(self.vel), 0.12)
-                time_to_target = self.dist_2d / abs_vel
+                abs_vel = max(abs(self.vel), 0.1)
+                time_to_target = max(self.dist_2d / abs_vel, 0.1)
                 
-                if time_to_climb > time_to_target * 0.9:
+                if time_to_climb > time_to_target * 0.85:
                     self.state = 'ORBIT'
-                    print(f"\n🔮 PREDICT | Большая Z-ошибка → переходим в орбиту (скорость уже выше)")
+                    print(f"\n🔮 PREDICT | Большая Z-ошибка → переходим в орбиту")
                     sys.stdout.flush()
 
-            # Динамический дифференциал (чуть агрессивнее на высокой скорости)
-            k_diff = self.K_diff_base * (1.0 + abs(self.vel) * 1.2)
+            k_diff = self.K_diff_base * (1.0 + abs(self.vel) * 1.3)
             diff = k_diff * yaw_err
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
 
         elif self.state == 'ORBIT':
-            # Безопасная скорость орбиты
-            target_orbit_speed = 0.80
+            target_orbit_speed = 0.75
             if self.vel > target_orbit_speed + 0.1:
                 thrust = 1.0
             else:
-                thrust = -target_orbit_speed * 3.3
+                thrust = -target_orbit_speed * 3.5
 
-            # === УЛУЧШЕННЫЙ КОНТРОЛЬ РАДИУСА ===
+            # === ОЧЕНЬ СИЛЬНЫЙ КОНТРОЛЬ РАДИУСА ===
             radius_error = self.dist_2d - ORBIT_RADIUS
-            # Более агрессивная коррекция + ограничение по углу
-            correction_angle = max(-0.85, min(0.85, radius_error * 0.38))   # ← было 0.12!
+            correction_angle = max(-1.0, min(1.0, radius_error * 0.55))   # ← было 0.38, теперь агрессивнее
             
-            # Базовый тангенциальный угол (против часовой)
             angle_to_sub = math.atan2(self.pos[1] - self.target_global[1],
                                       self.pos[0] - self.target_global[0])
             self.bearing = angle_to_sub + math.pi/2 + correction_angle
 
-            # Ограниченный дифференциал моторов (чтобы не скручивать на малой скорости)
-            k_diff = 2.8
+            k_diff = 3.0
             diff = k_diff * yaw_err
             cmd_lt = thrust + diff
             cmd_rt = thrust - diff
 
-            # Аварийный предохранитель крена
             if abs(math.degrees(roll_err)) > 35.0:
                 cmd_lt = thrust
                 cmd_rt = thrust
                 rudder_v = 0.0
 
-            # Выход из орбиты, когда глубина почти набрана
-            if abs(z_err) < 1.2:
+            # Выходим из орбиты только когда и глубина, и радиус почти идеальны
+            if abs(z_err) < 1.5 and abs(radius_error) < 4.0:
                 self.state = 'FINAL_LOCK'
-                print(f"\n🎯 FINAL | Глубина стабилизирована → выходим в центр")
+                print(f"\n🎯 FINAL | Орбита завершена → точный подход")
                 sys.stdout.flush()
 
         elif self.state == 'FINAL_LOCK':
-            target_speed = max(self.min_cruise_speed, min(1.0, self.dist_2d * 0.4))
-            if self.vel > target_speed + self.brake_threshold: thrust = 0.2  
-            else: thrust = -target_speed * 3.3
+            # Очень агрессивное торможение на финальном подходе
+            if self.dist_2d < 8.0:
+                target_speed = self.dist_2d * 0.12   # почти стоп
+            else:
+                target_speed = max(self.min_cruise_speed, min(1.2, self.dist_2d * 0.35))
 
-            diff = self.K_diff_base * yaw_err
-            cmd_lt = thrust + diff; cmd_rt = thrust - diff
+            if self.vel > target_speed + 0.15:
+                thrust = 1.2          # сильный тормоз
+            else:
+                thrust = -target_speed * 3.8
 
-            if self.dist_2d < 2.0 and abs(z_err) < 1.5:
+            diff = self.K_diff_base * 1.1 * yaw_err
+            cmd_lt = thrust + diff
+            cmd_rt = thrust - diff
+
+            if self.dist_2d < 3.0 and abs(z_err) < 1.3:
                 self.state = 'FINISH'
                 self._pub(0,0,0,0,0)
-                print(f"\n\r✅ МИССИЯ ЗАВЕРШЕНА | 1 ЭТАП ПОЛНОСТЬЮ ПОБЕЖДЕН!")
+                print(f"\n\r✅ МИССИЯ ЗАВЕРШЕНА | Точное попадание!")
                 print(f"Финиш: X={self.pos[0]:.2f} Y={self.pos[1]:.2f} Z={self.pos[2]:.2f}")
                 raise SystemExit
 
